@@ -76,103 +76,157 @@ def read_string_value(lines, start_idx):
                 idx += 1
             else:
                 break
+    if idx == start_idx:
+        idx = start_idx + 1
     return unescape_po(raw), idx
 
 
 def parse_po(filepath):
+    """Parse a PO file.
+
+    Returns (header, entries, obsolete):
+      - header:  dict for the msgid "" header block (includes 'raw' lines).
+      - entries: list of entry dicts; each keeps its source lines in 'raw'
+                 plus the parsed fields.
+      - obsolete: list of '#'-obsolete (#~) blocks, each a list of raw lines,
+                 preserved verbatim.
+    """
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
     lines = content.split('\n')
+    if lines and lines[-1] == '':
+        lines = lines[:-1]
 
     header = {'comment': '', 'tcomment': '', 'flags': [], 'occurrences': [],
-              'msgctxt': '', 'msgid': '', 'msgstr': ''}
+              'msgctxt': '', 'msgid': '', 'msgstr': '', 'raw': [],
+              '_msgstr_start': -1, '_flags_idx': -1, '_parsed_flags': []}
     entries = []
+    obsolete = []
+
     current = None
+    raw_block = []
+    obsolete_block = []
+
+    def flush_current():
+        nonlocal current, raw_block
+        if current is not None:
+            current['raw'] = list(raw_block)
+            entries.append(current)
+        current = None
+        raw_block = []
+
+    def flush_obsolete():
+        nonlocal obsolete_block
+        if obsolete_block:
+            obsolete.append(list(obsolete_block))
+            obsolete_block = []
 
     def new_entry():
-        return {'pre_lines': [], 'comment': '', 'tcomment': '', 'flags': [],
-                'occurrences': [], 'msgctxt': '', 'msgid': '', 'msgid_plural': '',
-                'msgstr': '', 'msgstr_plurals': {}}
+        return {'comment': '', 'tcomment': '', 'flags': [], 'occurrences': [],
+                'msgctxt': '', 'msgid': '', 'msgid_plural': '',
+                'msgstr': '', 'msgstr_plurals': {}, 'raw': [],
+                '_msgstr_start': -1, '_flags_idx': -1, '_parsed_flags': []}
 
     i = 0
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
 
-        if stripped == '' or stripped.startswith('#~'):
-            i += 1; continue
+        if stripped.startswith('#~'):
+            flush_current()
+            obsolete_block.append(line)
+            i += 1
+            continue
+
+        if stripped == '':
+            flush_current()
+            flush_obsolete()
+            i += 1
+            continue
+
+        if obsolete_block and stripped.startswith('#'):
+            # comment/flag lines interleaved inside an obsolete region belong
+            # to that region; absorb them so they are preserved verbatim.
+            obsolete_block.append(line)
+            i += 1
+            continue
+
+        if (stripped.startswith('#') and not stripped.startswith('#~')
+                and i + 1 < len(lines) and lines[i + 1].strip().startswith('#~')):
+            # flag/comment line that leads into a '#~' block: part of the
+            # obsolete region.
+            obsolete_block.append(line)
+            i += 1
+            continue
+
+        if current is None:
+            current = new_entry()
+            raw_block = []
+
+        raw_block.append(line)
 
         if stripped.startswith('#:'):
-            if current is not None and (current['msgid'] or current['msgstr']):
-                entries.append(current)
-            current = new_entry()
             occ_text = stripped[2:].strip()
             current['occurrences'] = [o.strip() for o in occ_text.split() if o.strip()]
-            i += 1; continue
-
-        if stripped.startswith('#,'):
-            flags_text = stripped[2:].strip()
-            target = current if current is not None else header
-            target['flags'] = [f.strip() for f in flags_text.split(',') if f.strip()]
-            i += 1; continue
-
-        if stripped.startswith('#.'):
+        elif stripped.startswith('#,'):
+            current['flags'] = [f.strip() for f in stripped[2:].split(',') if f.strip()]
+            current['_flags_idx'] = len(raw_block) - 1
+            current['_parsed_flags'] = list(current['flags'])
+        elif stripped.startswith('#.'):
             comment_text = stripped[2:]
-            target = current if current is not None else header
-            target['comment'] = (target['comment'] + '\n' + comment_text).strip('\n')
-            i += 1; continue
-
-        if stripped.startswith('#'):
+            current['comment'] = (current['comment'] + '\n' + comment_text).strip('\n')
+        elif stripped.startswith('#'):
             comment_text = stripped[1:].strip() if len(stripped) > 1 else ''
-            target = current if current is not None else header
-            target['tcomment'] = (target['tcomment'] + '\n' + comment_text).strip('\n')
-            i += 1; continue
-
-        if stripped.startswith('msgctxt '):
-            if current is None: current = new_entry()
+            current['tcomment'] = (current['tcomment'] + '\n' + comment_text).strip('\n')
+        elif stripped.startswith('msgctxt '):
+            file_i = i
             current['msgctxt'], i = read_string_value(lines, i)
+            raw_block.extend(lines[file_i + 1:i])
             continue
-
-        if stripped.startswith('msgid_plural '):
-            if current is None: current = new_entry()
+        elif stripped.startswith('msgid_plural '):
+            file_i = i
             current['msgid_plural'], i = read_string_value(lines, i)
+            raw_block.extend(lines[file_i + 1:i])
             continue
-
-        if stripped.startswith('msgid '):
-            if current is not None and current['msgid']:
-                entries.append(current)
-            if current is None:
-                current = new_entry()
+        elif stripped.startswith('msgid '):
+            file_i = i
             current['msgid'], i = read_string_value(lines, i)
+            raw_block.extend(lines[file_i + 1:i])
             continue
-
-        m = re.match(r'^msgstr\[(\d+)\]\s', stripped)
-        if m:
-            if current is None: current = new_entry()
-            idx = int(m.group(1))
-            val, i = read_string_value(lines, i)
-            current['msgstr_plurals'][idx] = val
-            if len(current['msgstr_plurals']) == 1:
-                current['msgstr'] = val
-            continue
-
-        if stripped.startswith('msgstr '):
-            if current is None: current = new_entry()
-            current['msgstr'], i = read_string_value(lines, i)
-            continue
+        else:
+            m = re.match(r'^msgstr\[(\d+)\]\s', stripped)
+            if m:
+                file_i = i
+                rb_idx = len(raw_block) - 1
+                idx = int(m.group(1))
+                val, i = read_string_value(lines, i)
+                raw_block.extend(lines[file_i + 1:i])
+                current['msgstr_plurals'][idx] = val
+                if len(current['msgstr_plurals']) == 1:
+                    current['msgstr'] = val
+                if current['_msgstr_start'] < 0:
+                    current['_msgstr_start'] = rb_idx
+                continue
+            if stripped.startswith('msgstr '):
+                file_i = i
+                rb_idx = len(raw_block) - 1
+                current['msgstr'], i = read_string_value(lines, i)
+                raw_block.extend(lines[file_i + 1:i])
+                current['_msgstr_start'] = rb_idx
+                continue
 
         i += 1
 
-    if current is not None and (current['msgid'] or current['msgstr'] or current['flags']):
-        entries.append(current)
+    flush_current()
+    flush_obsolete()
 
     if entries and entries[0]['msgid'] == '' and not entries[0]['flags']:
         header_entry = entries.pop(0)
-        header['msgstr'] = header_entry['msgstr']
-        if header_entry['comment']: header['comment'] = header_entry['comment']
-        if header_entry['tcomment']: header['tcomment'] = header_entry['tcomment']
+        for k in ('comment', 'tcomment', 'flags', 'occurrences', 'msgctxt',
+                  'msgstr', 'raw', '_msgstr_start', '_flags_idx', '_parsed_flags'):
+            header[k] = header_entry[k]
 
-    return header, entries
+    return header, entries, obsolete
 
 
 def status_of(entry):
@@ -189,70 +243,154 @@ def build_translation_memory(entries):
     return memory
 
 
-def write_po(filepath, header, entries):
+def _wrap(content, limit):
+    """Soft-wrap on spaces; the breaking space stays at the end of wrapped lines."""
+    if len(content) <= limit:
+        return [content]
+    words = content.split(' ')
     out = []
-    out.append('# SOME DESCRIPTIVE TITLE.')
-    out.append('# Copyright (C) YEAR THE PACKAGE\'S COPYRIGHT HOLDER')
-    out.append('# This file is distributed under the same license as the com.vysp3r.ProtonPlus package.')
-    if header.get('tcomment'):
-        for line in header['tcomment'].split('\n'):
-            if line.strip(): out.append(f'# {line}')
-    if header.get('comment'):
-        for line in header['comment'].split('\n'):
-            if line.strip(): out.append(f'#. {line}')
-    if header.get('flags'):
-        out.append('#, ' + ', '.join(header['flags']))
-    out.append('msgid ""')
-    ms = escape_po(header.get('msgstr', ''))
-    ms_parts = ms.split('\\n')
-    for pi, part in enumerate(ms_parts):
-        chunk = part + '\\n' if pi < len(ms_parts) - 1 else part
-        prefix = 'msgstr ' if pi == 0 else ''
-        out.append(f'{prefix}"{chunk}"')
+    cur = ''
+    for w in words:
+        if cur == '':
+            cur = w
+        elif len(cur) + 1 + len(w) <= limit:
+            cur += ' ' + w
+        else:
+            out.append(cur + ' ')
+            cur = w
+    if cur:
+        out.append(cur)
+    return out
 
+
+def _render_value(kw, val):
+    """Render a keyword + value as PO lines, splitting on escaped \\n and
+    soft-wrapping long chunks at 79 columns (mirrors merge_po.render_msgstr_block)."""
+    lines = []
+    ev = escape_po(val).split('\\n')
+    for pi, part in enumerate(ev):
+        chunk = part + '\\n' if pi < len(ev) - 1 else part
+        prefix = f'{kw} ' if pi == 0 else ''
+        pieces = _wrap(chunk, 79 - 2)
+        if not pieces:
+            lines.append(f'{prefix}""')
+            continue
+        if len(pieces[0]) + len(prefix) + 2 > 79:
+            first, rest = pieces[0], pieces[1:]
+            w1 = _wrap(first, 79 - 2 - len(prefix))
+            lines.append(f'{prefix}"{w1[0]}"')
+            lines.extend(f'"{p}"' for p in w1[1:])
+            lines.extend(f'"{p}"' for p in rest)
+        else:
+            lines.append(f'{prefix}"{pieces[0]}"')
+            lines.extend(f'"{p}"' for p in pieces[1:])
+    return lines
+
+
+def _render_msgstr(e):
+    lines = []
+    if e.get('msgid_plural'):
+        for idx in sorted(e.get('msgstr_plurals', {}).keys()):
+            lines.extend(_render_value('msgstr[' + str(idx) + ']', e['msgstr_plurals'][idx]))
+    else:
+        lines.extend(_render_value('msgstr', e.get('msgstr', '')))
+    return lines
+
+
+def _decode_msgstr_block(raw, start):
+    """Decode a msgstr/msgstr[N] block from raw lines into {idx: value}."""
+    vals = {}
+    i = start
+    while i < len(raw):
+        s = raw[i].strip()
+        m = re.match(r'^msgstr\[(\d+)\]\s', s)
+        if m:
+            val, i = read_string_value(raw, i)
+            vals[int(m.group(1))] = val
+            continue
+        if s.startswith('msgstr '):
+            val, i = read_string_value(raw, i)
+            vals[''] = val
+            continue
+        break
+    return vals
+
+
+def _translation_unchanged(old, e):
+    if e.get('msgid_plural'):
+        want = {k: v for k, v in e.get('msgstr_plurals', {}).items()}
+        return old == want
+    return old.get('') == e.get('msgstr', '')
+
+
+def _render_fallback(e):
+    lines = []
+    for occ in e.get('occurrences', []):
+        lines.append(f'#: {occ}')
+    if e.get('flags'):
+        lines.append('#, ' + ', '.join(e['flags']))
+    if e.get('comment', '').strip():
+        for cl in e['comment'].strip().split('\n'):
+            lines.append(f'#. {cl.strip()}')
+    if e.get('tcomment', '').strip():
+        for cl in e['tcomment'].strip().split('\n'):
+            if cl.strip(): lines.append(f'# {cl.strip()}')
+    if e.get('msgctxt'):
+        lines.extend(_render_value('msgctxt', e['msgctxt']))
+    lines.extend(_render_value('msgid', e['msgid']))
+    if e.get('msgid_plural'):
+        lines.extend(_render_value('msgid_plural', e['msgid_plural']))
+    lines.extend(_render_msgstr(e))
+    return lines
+
+
+def _emit_block(e):
+    """Emit one entry/header block, keeping its original lines verbatim except
+    for the msgstr block and the fuzzy flags line, which are re-rendered only
+    when they actually changed. This makes save round-trip safe."""
+    raw = e.get('raw')
+    if not raw:
+        return _render_fallback(e)
+
+    out = list(raw)
+
+    start = e.get('_msgstr_start', -1)
+    if start is not None and 0 <= start < len(out):
+        if not _translation_unchanged(_decode_msgstr_block(out, start), e):
+            out = out[:start] + _render_msgstr(e)
+
+    flags_changed = e.get('flags', []) != e.get('_parsed_flags', [])
+    if flags_changed:
+        fidx = e.get('_flags_idx')
+        if fidx is not None and 0 <= fidx < len(out):
+            if e.get('flags'):
+                out[fidx] = '#, ' + ', '.join(e['flags'])
+            else:
+                del out[fidx]
+        elif e.get('flags'):
+            insert = 0
+            while insert < len(out) and out[insert].startswith('#'):
+                insert += 1
+            out.insert(insert, '#, ' + ', '.join(e['flags']))
+
+    return out
+
+
+def write_po(filepath, header, entries, obsolete=None):
+    if obsolete is None:
+        obsolete = []
+    out = []
+    out.extend(_emit_block(header))
     for entry in entries:
         out.append('')
-        for occ in entry.get('occurrences', []):
-            out.append(f'#: {occ}')
-        if entry.get('flags'):
-            out.append('#, ' + ', '.join(entry['flags']))
-        if entry.get('comment', '').strip():
-            for cl in entry['comment'].strip().split('\n'):
-                out.append(f'#. {cl.strip()}')
-        if entry.get('tcomment', '').strip():
-            for cl in entry['tcomment'].strip().split('\n'):
-                if cl.strip(): out.append(f'# {cl.strip()}')
-
-        if entry.get('msgctxt'):
-            ec = escape_po(entry['msgctxt']).split('\\n')
-            for pi, part in enumerate(ec):
-                chunk = part + '\\n' if pi < len(ec) - 1 else part
-                out.append(f'{"msgctxt " if pi == 0 else ""}"{chunk}"')
-
-        em = escape_po(entry['msgid']).split('\\n')
-        for pi, part in enumerate(em):
-            chunk = part + '\\n' if pi < len(em) - 1 else part
-            out.append(f'{"msgid " if pi == 0 else ""}"{chunk}"')
-
-        if entry.get('msgid_plural'):
-            ep = escape_po(entry['msgid_plural']).split('\\n')
-            for pi, part in enumerate(ep):
-                chunk = part + '\\n' if pi < len(ep) - 1 else part
-                out.append(f'{"msgid_plural " if pi == 0 else ""}"{chunk}"')
-            for idx in sorted(entry.get('msgstr_plurals', {}).keys()):
-                ev = escape_po(entry['msgstr_plurals'][idx]).split('\\n')
-                for pi, part in enumerate(ev):
-                    chunk = part + '\\n' if pi < len(ev) - 1 else part
-                    out.append(f'{"msgstr[" + str(idx) + "] " if pi == 0 else ""}"{chunk}"')
-        else:
-            ems = escape_po(entry.get('msgstr', '')).split('\\n')
-            for pi, part in enumerate(ems):
-                chunk = part + '\\n' if pi < len(ems) - 1 else part
-                out.append(f'{"msgstr " if pi == 0 else ""}"{chunk}"')
+        out.extend(_emit_block(entry))
+    for block in obsolete:
+        out.append('')
+        out.extend(block)
 
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write('\n'.join(out))
-        if out and not out[-1].endswith('\n'):
+        if out:
             f.write('\n')
 
 
@@ -405,6 +543,7 @@ class TranslatorWindow(Gtk.ApplicationWindow):
         self.filepath = None
         self.header = {}
         self.entries = []
+        self.obsolete = []
         self.filtered = []
         self.current_index = 0
         self.modified = False
@@ -707,7 +846,7 @@ class TranslatorWindow(Gtk.ApplicationWindow):
 
     def _load_file(self, path):
         try:
-            header, entries = parse_po(path)
+            header, entries, obsolete = parse_po(path)
         except Exception as e:
             dlg = Gtk.AlertDialog()
             dlg.set_message(f"Failed to parse PO file:\n{e}")
@@ -716,6 +855,7 @@ class TranslatorWindow(Gtk.ApplicationWindow):
         self.filepath = path
         self.header = header
         self.entries = entries
+        self.obsolete = obsolete
         self.modified = False
         self.memory = build_translation_memory(entries)
         self._rebuild_filtered()
@@ -728,7 +868,7 @@ class TranslatorWindow(Gtk.ApplicationWindow):
 
     def _load_tm(self, path):
         try:
-            _, entries = parse_po(path)
+            _, entries, _ = parse_po(path)
         except Exception as e:
             dlg = Gtk.AlertDialog()
             dlg.set_message(f"Failed to parse:\n{e}")
@@ -746,7 +886,7 @@ class TranslatorWindow(Gtk.ApplicationWindow):
             return
         self._apply_current()
         try:
-            write_po(self.filepath, self.header, self.entries)
+            write_po(self.filepath, self.header, self.entries, self.obsolete)
             self.modified = False
             self.lbl_status.set_text("Saved!")
             self._update_counts()
@@ -762,7 +902,7 @@ class TranslatorWindow(Gtk.ApplicationWindow):
         if not self.filepath:
             return
         try:
-            write_po(self.filepath, self.header, self.entries)
+            write_po(self.filepath, self.header, self.entries, self.obsolete)
             self.modified = False
             self._update_counts()
         except Exception as e:
