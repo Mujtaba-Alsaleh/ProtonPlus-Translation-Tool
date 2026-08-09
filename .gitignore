@@ -2,7 +2,6 @@ __pycache__/*
 after-translation-steps.txt
 run protonplus with locale command.txt
 ar.po
-merge_po.py
 session-ses_02b4.md
 AGENTS.md
 README-local.md
